@@ -1,0 +1,210 @@
+pipeline {
+    //指定任务在哪个集群节点上执行
+    agent {
+        kubernetes {
+            cloud "kubernetes"  //选择名字是kubernetes的cloud,这里不要修改
+            inheritFrom "jenkins-agent-jdk17" //pod模板名称
+        }
+    }
+	//声明环境变量，方便后面使用
+	environment {
+	    APP_CODE = 'https://gitee.com/yaohaihan/moodiary-developer-heyuan.git'
+
+	    CODE_BRANCH = 'DeployTest'
+
+	    PROJECT_NAME='product-service-server'
+
+		 BACK_PATH= './'
+
+		 Dockerfile_BACK_PATH='./Product-service/'
+
+         SETTINGS_FILE="/opt/base_image/maven/conf/ali-settings.xml"
+
+		JAR_PATH = './Product-service/target/'
+
+		JAR_NAME = 'Product-service-0.0.1-SNAPSHOT.jar'
+
+		JAR_PORT = '8080'
+
+		MEMORY_SIZE = '-Xmx1000m'
+
+	    REGISTRY = '192.168.235.192:30002'
+        DOCKERHUB_NAMESPACE = 'service_images'
+        NAMESPACE= 'base-cluster'
+        HARBOR_SECRET= 'harbor'
+	}
+
+
+    stages {
+		stage('Pull code') {
+			steps {
+				echo "1.拉取代码"
+				git branch: "$CODE_BRANCH", credentialsId: '28731b6e-9cf4-4379-ab07-ea50fb7cdddf', url: "$APP_CODE"
+			}
+		}
+
+
+		stage('Unit testing') {
+			steps {
+				container('base-package-image') {
+					sh '''
+						cd ${BACK_PATH}
+                        mvn clean install -s ${SETTINGS_FILE}
+
+                        mvn -pl Product-service test -s ${SETTINGS_FILE}
+					'''
+				}
+			}
+		}
+
+		stage("Package the project using Maven"){
+		    steps {
+				container('base-package-image') {
+					sh '''
+						cd ${BACK_PATH}
+
+                        mvn package -Dmaven.test.skip=true -s ${SETTINGS_FILE}
+						echo '---------------jar---------------'
+					'''
+				}
+			}
+		}
+
+
+        stage('SonarQube Analysis') {
+            steps {
+                container('base-package-image') {
+                    withSonarQubeEnv('sonarqube') {
+                        sh '''
+                            cd ${BACK_PATH}/Product-service
+
+                            mvn clean verify -Dmaven.test.failure.ignore=true
+
+                            mvn sonar:sonar \
+                                -Dsonar.projectKey=product-service \
+                                -Dsonar.host.url=http://sonarqube:9000 \
+                                -Dsonar.login=squ_01e442260d05ff070ff0a8731df36c2e721ea137 \
+                                -Dsonar.qualitygate=moodiary \
+                                -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+                        '''
+                    }
+                }
+            }
+        }
+
+
+    //     stage('Dependency Check') {
+		  //  environment {
+    //             HTTP_PROXY = 'http://52.221.195.244:3128'
+    //             HTTPS_PROXY = 'http://52.221.195.244:3128'
+
+    //             NVD_API_KEY = '15fcccd0-3089-4118-b473-a40f6d733dbb'
+    //         }
+
+    //         steps {
+    //             container('base-package-image') {
+    //                 sh '''
+    //                     touch /root/.dependency-check/dependency-check.properties
+
+    //                     echo 'analyzer.cisa.enabled=false' > /root/.dependency-check/dependency-check.properties
+
+    //                     cat /root/.dependency-check/dependency-check.properties
+
+
+    //                     ls -la /root/.dependency-check/data/
+
+    //                     cd ${Dockerfile_BACK_PATH}
+
+
+    //                     mvn org.owasp:dependency-check-maven:check \
+    //                         -Dformat=HTML \
+    //                         -DoutputDirectory=dependency-check-report \
+    //                         -Danalyzer.cisa.enabled=false \
+    //                         -Danalyzer.retirejs.enabled=false \
+    //                         -Danalyzer.hosted.suppressions.enabled=false \
+    //                         -Danalyzer.assembly.enabled=false \
+    //                         -Dhttps.proxyHost=52.221.195.244 \
+    //                         -Dhttps.proxyPort=3128
+    //                 '''
+    //             }
+    //         }
+    //         post {
+    //             always {
+    //                 archiveArtifacts artifacts: 'User-service/target/dependency-check-report.html', allowEmptyArchive: true
+    //             }
+
+    //             success {
+    //                 publishHTML(target: [
+    //                     allowMissing: false,
+    //                     alwaysLinkToLastBuild: true,
+    //                     keepAll: true,
+    //                     reportDir: '/home/jenkins/agent/workspace/Product-service/Product-service/target/',
+    //                     reportFiles: 'dependency-check-report.html',
+    //                     reportName: 'Dependency Check Report'
+    //                 ])
+    //             }
+
+
+    //             failure {
+    //                 echo "Dependency vulnerabilities found. Review the report and fix them."
+    //             }
+    //         }
+    //     }
+
+		stage('Create a custom image using Docker') {
+			steps {
+				container('base-package-image') {
+					sh '''
+					    ls
+						cd ${BACK_PATH}
+						mv ${JAR_PATH}${JAR_NAME} ./
+						cp ${Dockerfile_BACK_PATH}Dockerfile ./
+						sed -i 's/<JAR_NAME>/'${JAR_NAME}'/' Dockerfile
+						sed -i 's/<MEMORY_SIZE>/'${MEMORY_SIZE}'/' Dockerfile
+                        sed -i 's/<VSERSION>/'SNAPSHOT-${BUILD_NUMBER}'/' Dockerfile
+						sed -i 's/<JAR_PORT>/'${JAR_PORT}'/' Dockerfile
+
+						docker build -t ${PROJECT_NAME}:SNAPSHOT-$BUILD_NUMBER .
+
+						rm ${JAR_NAME}
+					'''
+				}
+			}
+		}
+		stage('Push the custom image to the Harbor repository') {
+			steps {
+				container('base-package-image') {
+					withCredentials([usernamePassword(credentialsId: '67bccd9c-20dc-40c9-98b9-9bd752c19cd9',usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+						sh '''
+							docker login -u ${USERNAME} -p ${PASSWORD} $REGISTRY
+							docker tag ${PROJECT_NAME}:SNAPSHOT-${BUILD_NUMBER} ${REGISTRY}/${DOCKERHUB_NAMESPACE}/${PROJECT_NAME}:SNAPSHOT-${BUILD_NUMBER}
+							docker rmi ${PROJECT_NAME}:SNAPSHOT-${BUILD_NUMBER}
+							docker push ${REGISTRY}/${DOCKERHUB_NAMESPACE}/${PROJECT_NAME}:SNAPSHOT-${BUILD_NUMBER}
+							docker rmi ${REGISTRY}/${DOCKERHUB_NAMESPACE}/${PROJECT_NAME}:SNAPSHOT-${BUILD_NUMBER}
+						'''
+					}
+				}
+			}
+		}
+		stage('K8S Deployment - Development Environment') {
+            steps {
+                container('base-package-image') {
+                    sh '''
+                        ls
+                        sed -i 's/<JAR_PORT>/'${JAR_PORT}'/' deploy_back.yaml
+                        sed -i 's/<PROJECT_NAME>/'${PROJECT_NAME}'/' deploy_back.yaml
+                        sed -i 's/<NAMESPACE>/'${NAMESPACE}'/' deploy_back.yaml
+                        sed -i 's/<REGISTRY>/'${REGISTRY}'/' deploy_back.yaml
+                        sed -i 's/<DOCKERHUB_NAMESPACE>/'${DOCKERHUB_NAMESPACE}'/' deploy_back.yaml
+                        sed -i 's/<BUILD_NUMBER>/'${BUILD_NUMBER}'/' deploy_back.yaml
+                        sed -i 's/<MEMORY_SIZE>/'${MEMORY_SIZE}'/' deploy_back.yaml
+                        sed -i 's/<BUILD_NUMBER>/'${BUILD_NUMBER}'/' deploy_back.yaml
+                        sed -i 's/<JAR_NAME>/'${JAR_NAME}'/' deploy_back.yaml
+                        sed -i 's/<HARBOR_SECRET>/'${HARBOR_SECRET}'/' deploy_back.yaml
+                        kubectl apply -f deploy_back.yaml
+                    '''
+                }
+            }
+        }
+    }
+}
